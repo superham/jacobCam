@@ -45,7 +45,7 @@ devices and hands them to WinUSB.
 ```
 ┌─────────────────────────────┐   ┌──────────────────────────────┐
 │ qcamsvc.exe                 │   │ Frame Server (LOCAL SERVICE) │
-│ LocalSystem                 │   │                              │
+│ NT SERVICE\qcamsvc          │   │                              │
 │                             │   │  ┌────────────────────────┐  │
 │  Camera                     │   │  │ qcamvcam.dll           │  │
 │   ├ WinUsbTransport ────────┼───┼─▶│  QcamMediaSource       │  │
@@ -69,10 +69,17 @@ media source opened the device directly, then `qcamctl` could not run at the
 same time, and two applications opening the camera at once would fight over
 it.
 
-**The isochronous pipeline should be set up once.** Alternate-setting switches
+**The isochronous pipeline should not churn.** Alternate-setting switches
 and bandwidth reservation are not free, and this camera takes about 250 ms
-after enumeration before it will answer I2C at all. Doing that on every app
-launch would make the camera feel broken.
+after enumeration before it will answer I2C at all. The service opens the
+camera when the first reader asks and keeps it open until readers have been
+gone for ten seconds. An app restarting its pipeline, or a second app joining,
+reuses the running stream rather than re-running sensor init.
+
+It does *not* keep the camera open all the time. An open camera is a live
+feed into shared memory, and streaming only on demand means a plugged-in,
+unused camera is actually off. The cost is a second or two of grey frames when
+an app first opens it.
 
 **The Frame Server is not a good place to own hardware.** It loads the source
 into a shared, sandboxed service process. Keeping USB ownership, sensor
@@ -181,20 +188,38 @@ grey-world estimator will happily chase sensor noise into a magenta cast.
 
 ## Output geometry
 
-Native is 360 × 296, which is not a size any application expects. The service
-publishes **352 × 288 (CIF)** by default, centre-cropped rather than scaled —
-cropping four pixels off each edge keeps the picture exactly as sharp as the
-sensor made it, where scaling to a "nicer" size would soften every pixel to
-gain nothing.
+Native is 360 × 296. The service publishes exactly that, every sensor pixel
+and nothing resampled, and the virtual camera offers it to apps as the
+default media type.
 
-Larger sizes are available and bilinearly upscaled, for applications that
-insist on VGA.
+Not every application accepts a size that unusual, so the virtual camera also
+offers **640 × 480** and **320 × 240**. For those it centre-crops the native
+frame to 4:3 and scales it bilinearly, per stream, in the Frame Server
+process. That adds no detail, but an app that insists on VGA still opens the
+camera instead of failing.
 
 ## Frame rate honesty
 
 The camera sustains about 7.9 fps and the driver advertises that, as a
 fraction, rather than claiming 15 or 30. Media Foundation is perfectly happy
 with a fractional rate.
+
+It only sustains that while the exposure fits inside one frame period. On
+the HDCS-1000 that is an exposure setting of 128 or less; beyond that every
+step lengthens the frame, down to about 3 fps at the maximum. The service
+therefore caps auto-exposure at 128 and makes up the rest with gain. In a dim
+room the picture is noisier than it could be, but motion stays smooth, and
+the advertised rate stays true.
+
+## Picture controls
+
+Brightness, contrast, saturation and gamma arrive at the virtual camera as
+the standard VideoProcAmp properties apps' settings panels use. The virtual
+camera writes them into a small shared block (`Global\qcam.controls.*`),
+which is the one object the Frame Server may write. qcamsvc checks it on
+every frame and hands changes to the decoder at the next frame boundary. The
+block lives as long as the service, so a setting outlasts the camera being
+closed and reopened between apps.
 
 The alternative — advertising 30 fps and repeating each frame four times —
 makes the camera look better in a device-properties dialog and worse

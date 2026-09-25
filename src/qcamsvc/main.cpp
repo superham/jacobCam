@@ -53,11 +53,16 @@ int Usage() {
         "  --console           run in the foreground; Ctrl-C to stop\n"
         "  --install           register the service (administrator)\n"
         "  --uninstall         remove the service (administrator)\n"
+        "  --register-vcam     register the system-wide camera (administrator)\n"
         "  --remove-vcam       remove the registered virtual camera\n"
         "\n"
         "options:\n"
-        "  --size WxH          published frame size (default 352x288)\n"
-        "  --no-vcam           do not register a system-wide camera\n"
+        "  --size WxH          published frame size (default: sensor native,\n"
+        "                      360x296; apps can still pick other sizes)\n"
+        "  --vcam              console mode: also register a temporary camera\n"
+        "                      that lasts until Ctrl-C (administrator)\n"
+        "  --always-on         console mode: stream whenever the camera is\n"
+        "                      plugged in, not only while an app reads frames\n"
         "  --name \"TEXT\"       friendly name shown in app camera pickers\n"
         "  -v, --verbose       verbose logging\n");
     return 2;
@@ -69,12 +74,17 @@ int wmain(int argc, wchar_t** argv) {
     ServiceOptions options;
     bool console = false;
     bool verbose = false;
+    std::wstring command;
 
     for (int i = 1; i < argc; ++i) {
         const std::wstring arg = argv[i];
         if (arg == L"--console")        console = true;
         else if (arg == L"-v" || arg == L"--verbose") verbose = true;
-        else if (arg == L"--no-vcam")   options.register_vcam = false;
+        else if (arg == L"--vcam")      options.session_vcam = true;
+        else if (arg == L"--always-on") options.always_on = true;
+        // Older install scripts passed this; the service no longer registers
+        // a camera on its own, so it is accepted and ignored.
+        else if (arg == L"--no-vcam")   {}
         else if (arg == L"--name" && i + 1 < argc) options.friendly_name = argv[++i];
         else if (arg == L"--size" && i + 1 < argc) {
             int w = 0, h = 0;
@@ -83,23 +93,29 @@ int wmain(int argc, wchar_t** argv) {
                 options.out_height = static_cast<uint16_t>(h);
             }
         }
-        else if (arg == L"--install") {
-            SetLogSink(&LogToStderr);
-            return Failed(InstallService(ExecutablePath())) ? 1 : 0;
-        }
-        else if (arg == L"--uninstall") {
-            SetLogSink(&LogToStderr);
-            return Failed(UninstallService()) ? 1 : 0;
-        }
-        else if (arg == L"--remove-vcam") {
-            SetLogSink(&LogToStderr);
-            return Failed(RemoveVirtualCamera()) ? 1 : 0;
+        else if (arg == L"--install" || arg == L"--uninstall" ||
+                 arg == L"--register-vcam" || arg == L"--remove-vcam") {
+            command = arg;
         }
         else if (arg == L"-h" || arg == L"--help") return Usage();
         else {
             std::fwprintf(stderr, L"unknown argument '%ls'\n\n", arg.c_str());
             return Usage();
         }
+    }
+
+    // One-shot commands run after parsing, so --name applies wherever it
+    // appears on the command line.
+    if (!command.empty()) {
+        SetLogSink(&LogToStderr);
+        Status st = Status::Ok;
+        if (command == L"--install")          st = InstallService(ExecutablePath());
+        else if (command == L"--uninstall")   st = UninstallService();
+        else if (command == L"--register-vcam")
+            st = RegisterPersistentVirtualCamera(options.friendly_name);
+        else if (command == L"--remove-vcam")
+            st = RemoveVirtualCamera(options.friendly_name);
+        return Failed(st) ? 1 : 0;
     }
 
     if (!console) return RunAsService();

@@ -123,6 +123,12 @@ void Rgb24ToNv12(const uint8_t* rgb, uint16_t w, uint16_t h, uint8_t* nv12);
 void Rgb24ToBgra(const uint8_t* rgb, uint16_t w, uint16_t h, uint8_t* bgra);
 void Rgb24ToYuy2(const uint8_t* rgb, uint16_t w, uint16_t h, uint8_t* yuy2);
 
+// Resizes an NV12 image, first centre-cropping the source to the
+// destination's aspect ratio so nothing is stretched, then scaling both planes
+// bilinearly. All dimensions must be even. Equal sizes are a plain copy.
+void ScaleNv12(const uint8_t* src, uint16_t src_w, uint16_t src_h,
+               uint8_t* dst, uint16_t dst_w, uint16_t dst_h);
+
 // Returns the CFA colour (0=R, 1=G, 2=B) at (x, y) for a given phase.
 int BayerColorAt(BayerPhase phase, int x, int y);
 

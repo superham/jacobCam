@@ -8,9 +8,9 @@
 ; devices and hand them over, which is why the driver needs no kernel
 ; debugging, no WHQL submission and cannot bugcheck the machine.
 ;
-; The package still has to be signed to install on 64-bit Windows. See
-; docs/installing.md for both routes (test signing for development,
-; attestation signing through Partner Center for distribution).
+; The package still has to be signed to install on 64-bit Windows.
+; scripts/install.ps1 signs it with a single-use local certificate; see
+; docs/installing.md, which also covers attestation signing for distribution.
 
 [Version]
 Signature   = "$Windows NT$"

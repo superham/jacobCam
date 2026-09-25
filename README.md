@@ -87,24 +87,19 @@ hardware itself. That is a much smaller search space.
 
 ### 3. Bind the camera to WinUSB
 
-This is the step that stalls people, and it is about signing, not about this
-driver.
-
 `qcamusb.inf` contains no code — it just hands the device to the inbox WinUSB
-driver — but Windows still requires the **package** to be signed before it will
-install on 64-bit. For your own machine, test signing is the quick route:
+driver — but Windows still requires the **package** to be signed before it
+will install it. The installer signs it with a single-use certificate whose
+private key is destroyed straight afterwards. No test-signing mode, no reboot,
+and Secure Boot stays on. [`docs/installing.md`](docs/installing.md) explains
+why that is safe.
 
 ```powershell
-bcdedit /set testsigning on     # elevated; needs a reboot, and Secure Boot off
+.\scripts\install.ps1 -BinDir .\build\RelWithDebInfo -DriverOnly   # elevated
 ```
 
-Then sign the package and install it. Full instructions, including the
-distribution route (attestation signing via Partner Center), are in
-[`docs/installing.md`](docs/installing.md).
-
-```powershell
-pnputil /add-driver driver\qcamusb.inf /install
-```
+`-DriverOnly` installs just the binding and not the service, which would take
+the camera for itself before step 4 can use it.
 
 **Working looks like:** in Device Manager, under **Universal Serial Bus
 devices**, an entry named *"Logitech QuickCam Express (qcam)"*.
@@ -224,16 +219,29 @@ Only once step 4 produces good frames.
 .\scripts\install.ps1 -BinDir .\build\RelWithDebInfo
 ```
 
-That registers the COM media source, installs `qcamsvc` and starts it.
+That copies the binaries to `C:\Program Files\qcam\`, registers the COM media
+source and the virtual camera, then installs `qcamsvc` and starts it. The
+service runs as a low-privilege `LOCAL SERVICE` identity, not LocalSystem.
+From here on everything runs from Program Files, not from your build
+directory, so rebuilding does nothing until you re-run the script.
 
-The service takes **exclusive** ownership of the camera from here on, so
+The service **only opens the camera while an app is using it**. When an app
+starts reading frames, the service opens the camera, which takes a second or
+two, so the first frames are grey. Ten seconds after the last app stops, it
+closes the camera again. Plugged in and idle, the camera is not streaming
+anywhere.
+
+While an app has the camera, the service owns it **exclusively**, so
 `qcamctl probe`, `capture` and `stream` will report `Busy`. That is deliberate,
 not a limitation: opening the device runs the sensor init sequence, and a
 second process doing that to a live stream would corrupt it. Stop the service
 (`Stop-Service qcamsvc`) when you want to drive the hardware directly again.
 
-While it is running, use `attach` instead — it reads the service's
-shared-memory ring, exactly the way the virtual camera does:
+Only the Windows camera service may read the service's frames, so Windows'
+camera privacy settings and in-use indicator cover this camera the same as
+any other. To look at them yourself, use `attach` from an **elevated**
+prompt. It reads the service's shared-memory ring the way the virtual camera
+does, and asks the service to start the camera just as an app would:
 
 ```powershell
 .\qcamctl.exe attach -t 5
@@ -246,10 +254,15 @@ To watch the service work, stop it and run it in the foreground:
 
 ```powershell
 Stop-Service qcamsvc
-.\qcamsvc.exe --console -v
+& "C:\Program Files\qcam\qcamsvc.exe" --console -v
 ```
 
-To undo everything: `.\scripts\uninstall.ps1 -BinDir .\build\RelWithDebInfo -RemoveDriver`.
+To undo everything: `.\scripts\uninstall.ps1`. It removes every piece,
+including the driver and its certificate, and there are no Windows settings
+to put back.
+
+To set it up on another computer, see
+[Moving to another computer](docs/installing.md#moving-to-another-computer).
 
 ### If it doesn't work
 

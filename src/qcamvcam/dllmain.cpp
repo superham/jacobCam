@@ -56,12 +56,12 @@ public:
         *ppv = nullptr;
         if (outer) return CLASS_E_NOAGGREGATION;
 
-        auto* source = new (std::nothrow) QcamMediaSource();
-        if (!source) return E_OUTOFMEMORY;
+        auto* activate = new (std::nothrow) QcamActivate();
+        if (!activate) return E_OUTOFMEMORY;
 
-        HRESULT hr = source->Initialize();
-        if (SUCCEEDED(hr)) hr = source->QueryInterface(riid, ppv);
-        source->Release();
+        HRESULT hr = activate->Initialize();
+        if (SUCCEEDED(hr)) hr = activate->QueryInterface(riid, ppv);
+        activate->Release();
         return hr;
     }
 

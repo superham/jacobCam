@@ -9,6 +9,8 @@
 #include <sddl.h>
 
 #include <cstring>
+#include <iterator>
+#include <string>
 
 #include "qcam/log.h"
 #include "qcam/win_guids.h"
@@ -27,30 +29,66 @@ uint8_t* SlotAt(uint8_t* base, uint32_t slot_bytes, uint32_t index) {
     return base + sizeof(RingHeader) + SlotStride(slot_bytes) * index;
 }
 
-// The virtual camera source is loaded by the Windows Frame Server, which runs
-// as LOCAL SERVICE. A default DACL would grant access only to SYSTEM and to
-// Administrators, so the Frame Server could not open the ring at all and the
-// camera would enumerate but never produce a frame. These descriptors give
-// the service full control and every plausible consumer read access.
+// Who may touch the ring and its events. The frames are a live camera feed,
+// so this is the camera's privacy boundary: Windows' own camera privacy
+// settings and in-use indicator apply at the Frame Server, and anything else
+// that could read the ring directly would bypass both. So:
+//
+//   SYSTEM, Administrators   full (elevated qcamctl attach, debugging)
+//   NT SERVICE\qcamsvc       full; the writer
+//   NT SERVICE\FrameServer   read; hosts qcamvcam.dll and so the only
+//                            ordinary consumer
+//
+// Both services run as LOCAL SERVICE, so granting that account would hand
+// the writer's rights to the Frame Server and let every other LOCAL SERVICE
+// process read the camera. The per-service SIDs tell them apart.
 //
 // Sections: GENERIC_READ already implies SECTION_MAP_READ.
-constexpr wchar_t kSectionSddl[] =
-    L"D:P"
-    L"(A;;GA;;;SY)"          // LocalSystem: full
-    L"(A;;GA;;;BA)"          // Administrators: full
-    L"(A;;GR;;;LS)"          // LOCAL SERVICE (Frame Server): read
-    L"(A;;GR;;;NS)"          // NETWORK SERVICE: read
-    L"(A;;GR;;;IU)";         // interactive users (qcamctl): read
-
 // Events: GENERIC_READ does not include SYNCHRONIZE, so readers need it
-// spelled out (0x00100000) or WaitForSingleObject fails with access denied.
-constexpr wchar_t kEventSddl[] =
-    L"D:P"
-    L"(A;;0x1F0003;;;SY)"    // EVENT_ALL_ACCESS
-    L"(A;;0x1F0003;;;BA)"
-    L"(A;;0x00100002;;;LS)"  // SYNCHRONIZE | EVENT_MODIFY_STATE
-    L"(A;;0x00100002;;;NS)"
-    L"(A;;0x00100002;;;IU)";
+// spelled out, and EVENT_MODIFY_STATE to reset the frame event and to signal
+// the demand event.
+constexpr wchar_t kSectionAll[]  = L"GA";
+constexpr wchar_t kSectionRead[] = L"GR";
+// The picture-control block is the one object the Frame Server may write:
+// that is how an app's brightness slider reaches the decoder.
+constexpr wchar_t kSectionReadWrite[] = L"GRGW";
+constexpr wchar_t kEventAll[]    = L"0x1F0003";    // EVENT_ALL_ACCESS
+constexpr wchar_t kEventRead[]   = L"0x00100002";  // SYNCHRONIZE | EVENT_MODIFY_STATE
+
+// An ACE granting `rights` to a per-service SID, or an empty string when that
+// service does not exist on this machine.
+std::wstring ServiceAce(const wchar_t* account, const wchar_t* rights) {
+    BYTE sid[SECURITY_MAX_SID_SIZE];
+    DWORD sid_size = sizeof(sid);
+    wchar_t domain[256];
+    DWORD domain_size = static_cast<DWORD>(std::size(domain));
+    SID_NAME_USE use;
+    if (!::LookupAccountNameW(nullptr, account, sid, &sid_size, domain,
+                              &domain_size, &use)) {
+        return std::wstring();
+    }
+    wchar_t* text = nullptr;
+    if (!::ConvertSidToStringSidW(sid, &text)) return std::wstring();
+    std::wstring ace = std::wstring(L"(A;;") + rights + L";;;" + text + L")";
+    ::LocalFree(text);
+    return ace;
+}
+
+std::wstring BuildSddl(const wchar_t* all, const wchar_t* read) {
+    std::wstring sddl = std::wstring(L"D:P(A;;") + all + L";;;SY)(A;;" + all + L";;;BA)";
+    // Missing when qcamsvc is not installed (console mode from an elevated
+    // prompt), where the Administrators ACE already covers the writer.
+    sddl += ServiceAce(QCAM_SERVICE_ACCOUNT, all);
+    std::wstring reader = ServiceAce(QCAM_READER_ACCOUNT, read);
+    if (reader.empty()) {
+        // No Frame Server service on this build of Windows: fall back to the
+        // account it would run as, so the camera works rather than failing
+        // closed on a machine that has no system camera stack to protect.
+        QCAM_LOGW("NT SERVICE\\FrameServer not found; granting LOCAL SERVICE read");
+        reader = std::wstring(L"(A;;") + read + L";;;LS)";
+    }
+    return sddl + reader;
+}
 
 // Owns the descriptor allocated by the SDDL converter.
 class ScopedSecurityAttributes {
@@ -132,7 +170,8 @@ Status FrameRingWriter::Create(const RingConfig& config) {
 
     const size_t total = sizeof(RingHeader) + SlotStride(slot_bytes) * kRingSlots;
 
-    ScopedSecurityAttributes section_sa(kSectionSddl);
+    const std::wstring section_sddl = BuildSddl(kSectionAll, kSectionRead);
+    ScopedSecurityAttributes section_sa(section_sddl.c_str());
     impl_->mapping = ::CreateFileMappingW(INVALID_HANDLE_VALUE, section_sa.get(),
                                           PAGE_READWRITE, 0,
                                           static_cast<DWORD>(total),
@@ -152,7 +191,8 @@ Status FrameRingWriter::Create(const RingConfig& config) {
         return Status::Io;
     }
 
-    ScopedSecurityAttributes event_sa(kEventSddl);
+    const std::wstring event_sddl = BuildSddl(kEventAll, kEventRead);
+    ScopedSecurityAttributes event_sa(event_sddl.c_str());
     // Manual reset, so a frame published while every reader was busy is not
     // missed by the next waiter.
     impl_->event = ::CreateEventW(event_sa.get(), /*manual=*/TRUE, FALSE,
@@ -235,24 +275,74 @@ Status FrameRingWriter::Publish(const uint8_t* data, size_t size,
 }
 
 // ---------------------------------------------------------------------------
+// Demand
+// ---------------------------------------------------------------------------
+
+struct FrameDemand::Impl {
+    HANDLE event = nullptr;
+    ~Impl() { if (event) ::CloseHandle(event); }
+};
+
+FrameDemand::FrameDemand() : impl_(new Impl()) {}
+FrameDemand::~FrameDemand() = default;
+
+Status FrameDemand::Create() {
+    Close();
+    const std::wstring sddl = BuildSddl(kEventAll, kEventRead);
+    ScopedSecurityAttributes sa(sddl.c_str());
+    // Auto-reset: the service consumes each signal as it checks for one, so a
+    // signal always means "someone asked since you last looked".
+    impl_->event = ::CreateEventW(sa.get(), /*manual=*/FALSE, FALSE,
+                                  QCAM_DEMAND_EVENT);
+    if (!impl_->event) {
+        QCAM_LOGE("CreateEvent (demand) failed: %lu", ::GetLastError());
+        return Status::Io;
+    }
+    return Status::Ok;
+}
+
+void FrameDemand::Close() {
+    if (impl_->event) {
+        ::CloseHandle(impl_->event);
+        impl_->event = nullptr;
+    }
+}
+
+void* FrameDemand::wait_handle() const { return impl_->event; }
+
+// ---------------------------------------------------------------------------
 // Reader
 // ---------------------------------------------------------------------------
 
 struct FrameRingReader::Impl {
     HANDLE            mapping = nullptr;
     HANDLE            event   = nullptr;
+    HANDLE            demand  = nullptr;   // outlives Close(); see SignalDemand
     uint8_t*          view    = nullptr;
     const RingHeader* header  = nullptr;
     uint32_t          slot_bytes = 0;
     uint64_t          last_sequence = 0;
 
-    ~Impl() { Close(); }
+    ~Impl() {
+        Close();
+        if (demand) ::CloseHandle(demand);
+    }
 
     void Close() {
         if (event)   { ::CloseHandle(event);   event = nullptr; }
         if (view)    { ::UnmapViewOfFile(view); view = nullptr; }
         if (mapping) { ::CloseHandle(mapping); mapping = nullptr; }
         header = nullptr;
+    }
+
+    // Tells the service a reader wants frames. Called before the ring exists
+    // (that is how the service learns to open the camera) and on every read
+    // (that is how it learns to keep it open). Best effort: an older service,
+    // or none at all, simply has no demand event to find.
+    void SignalDemand() {
+        if (!demand)
+            demand = ::OpenEventW(EVENT_MODIFY_STATE, FALSE, QCAM_DEMAND_EVENT);
+        if (demand) ::SetEvent(demand);
     }
 };
 
@@ -263,8 +353,14 @@ bool FrameRingReader::IsOpen() const { return impl_ && impl_->header != nullptr;
 
 Status FrameRingReader::Open() {
     Close();
+    impl_->SignalDemand();
 
     impl_->mapping = ::OpenFileMappingW(FILE_MAP_READ, FALSE, QCAM_RING_NAME);
+    if (!impl_->mapping && ::GetLastError() == ERROR_ACCESS_DENIED) {
+        // Present, but only the Frame Server and administrators may read it.
+        QCAM_LOGD("frame ring access denied (not elevated?)");
+        return Status::Busy;
+    }
     if (!impl_->mapping) {
         // The service is not running, which is the common case rather than an
         // error: the virtual camera just has nothing to show yet.
@@ -348,6 +444,7 @@ Status FrameRingReader::Read(std::vector<uint8_t>* out, FrameMeta* meta,
                              uint32_t timeout_ms) {
     if (!out || !meta) return Status::InvalidArg;
     if (!IsOpen()) return Status::NoDevice;
+    impl_->SignalDemand();
 
     const DWORD deadline = ::GetTickCount() + timeout_ms;
     for (;;) {
@@ -420,6 +517,136 @@ Status FrameRingReader::Read(std::vector<uint8_t>* out, FrameMeta* meta,
         if (wait == WAIT_TIMEOUT) return Status::Timeout;
         if (wait != WAIT_OBJECT_0) return Status::Io;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Picture controls
+// ---------------------------------------------------------------------------
+
+namespace {
+
+PictureControls LoadControls(const ControlBlock* block) {
+    PictureControls p;
+    p.brightness = block->brightness.load(std::memory_order_relaxed);
+    p.contrast   = block->contrast.load(std::memory_order_relaxed);
+    p.saturation = block->saturation.load(std::memory_order_relaxed);
+    p.gamma      = block->gamma.load(std::memory_order_relaxed);
+    return p;
+}
+
+void StoreControls(ControlBlock* block, const PictureControls& p) {
+    block->brightness.store(p.brightness, std::memory_order_relaxed);
+    block->contrast.store(p.contrast, std::memory_order_relaxed);
+    block->saturation.store(p.saturation, std::memory_order_relaxed);
+    block->gamma.store(p.gamma, std::memory_order_relaxed);
+    // Release: a reader that sees the new generation sees the values too.
+    block->generation.fetch_add(1, std::memory_order_release);
+}
+
+}  // namespace
+
+struct PictureControlHost::Impl {
+    HANDLE          mapping = nullptr;
+    ControlBlock*   block   = nullptr;
+    uint32_t        seen_generation = 0;
+    PictureControls current;
+
+    ~Impl() { Close(); }
+    void Close() {
+        if (block)   { ::UnmapViewOfFile(block); block = nullptr; }
+        if (mapping) { ::CloseHandle(mapping); mapping = nullptr; }
+    }
+};
+
+PictureControlHost::PictureControlHost() : impl_(new Impl()) {}
+PictureControlHost::~PictureControlHost() = default;
+
+Status PictureControlHost::Create(const PictureControls& initial) {
+    Close();
+    impl_->current = initial;
+
+    const std::wstring sddl = BuildSddl(kSectionAll, kSectionReadWrite);
+    ScopedSecurityAttributes sa(sddl.c_str());
+    impl_->mapping = ::CreateFileMappingW(INVALID_HANDLE_VALUE, sa.get(), PAGE_READWRITE,
+                                          0, sizeof(ControlBlock), QCAM_CONTROLS_NAME);
+    if (!impl_->mapping) {
+        QCAM_LOGE("CreateFileMapping (controls) failed: %lu", ::GetLastError());
+        return Status::Io;
+    }
+    impl_->block = static_cast<ControlBlock*>(
+        ::MapViewOfFile(impl_->mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(ControlBlock)));
+    if (!impl_->block) {
+        QCAM_LOGE("MapViewOfFile (controls) failed: %lu", ::GetLastError());
+        impl_->Close();
+        return Status::Io;
+    }
+
+    impl_->block->magic   = kControlMagic;
+    impl_->block->version = kControlVersion;
+    StoreControls(impl_->block, initial);
+    impl_->seen_generation = impl_->block->generation.load(std::memory_order_acquire);
+    return Status::Ok;
+}
+
+void PictureControlHost::Close() {
+    if (impl_) impl_->Close();
+}
+
+PictureControls PictureControlHost::Current() const { return impl_->current; }
+
+bool PictureControlHost::Poll(PictureControls* out) {
+    if (!impl_->block) return false;
+    const uint32_t gen = impl_->block->generation.load(std::memory_order_acquire);
+    if (gen == impl_->seen_generation) return false;
+    impl_->seen_generation = gen;
+    impl_->current = LoadControls(impl_->block);
+    if (out) *out = impl_->current;
+    return true;
+}
+
+struct PictureControlClient::Impl {
+    HANDLE        mapping = nullptr;
+    ControlBlock* block   = nullptr;
+
+    ~Impl() {
+        if (block)   ::UnmapViewOfFile(block);
+        if (mapping) ::CloseHandle(mapping);
+    }
+};
+
+PictureControlClient::PictureControlClient() : impl_(new Impl()) {}
+PictureControlClient::~PictureControlClient() = default;
+
+bool PictureControlClient::IsOpen() const { return impl_ && impl_->block != nullptr; }
+
+Status PictureControlClient::Open() {
+    if (IsOpen()) return Status::Ok;
+    impl_->mapping = ::OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE,
+                                        QCAM_CONTROLS_NAME);
+    if (!impl_->mapping) {
+        const DWORD err = ::GetLastError();
+        return (err == ERROR_ACCESS_DENIED) ? Status::Busy : Status::NoDevice;
+    }
+    auto* block = static_cast<ControlBlock*>(::MapViewOfFile(
+        impl_->mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(ControlBlock)));
+    if (!block || block->magic != kControlMagic || block->version != kControlVersion) {
+        if (block) ::UnmapViewOfFile(block);
+        ::CloseHandle(impl_->mapping);
+        impl_->mapping = nullptr;
+        return block ? Status::Unsupported : Status::Io;
+    }
+    impl_->block = block;
+    return Status::Ok;
+}
+
+PictureControls PictureControlClient::Get() const {
+    return IsOpen() ? LoadControls(impl_->block) : PictureControls{};
+}
+
+Status PictureControlClient::Set(const PictureControls& controls) {
+    if (!IsOpen()) return Status::NoDevice;
+    StoreControls(impl_->block, controls);
+    return Status::Ok;
 }
 
 }  // namespace qcam

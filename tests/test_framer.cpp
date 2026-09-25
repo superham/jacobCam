@@ -178,7 +178,7 @@ TEST(FramerDropsShortFrameWhenConfiguredTo) {
     CHECK_EQ(framer.stats().frames_short, uint64_t{1});
 }
 
-TEST(FramerClipsOverrunAndKeepsFrameUsable) {
+TEST(FramerDropsOverrunFrame) {
     ChunkFramer framer;
     Capture cap;
     framer.Configure(Geom(), Bridge::Stv0600);
@@ -191,12 +191,35 @@ TEST(FramerClipsOverrunAndKeepsFrameUsable) {
     });
     framer.FeedPacket(packet.data(), packet.size());
 
-    CHECK_EQ(cap.frames.size(), size_t{1});
-    if (cap.frames.empty()) return;
-    CHECK_EQ(cap.frames[0].size(), kFrameBytes);
-    CHECK_EQ(cap.complete[0], true);
+    CHECK_EQ(cap.frames.size(), size_t{0});
     CHECK_EQ(framer.stats().frames_overrun, uint64_t{1});
     CHECK_EQ(framer.stats().bytes_dropped, uint64_t{12});
+}
+
+TEST(FramerRecoversAfterOverrunFrame) {
+    ChunkFramer framer;
+    Capture cap;
+    framer.Configure(Geom(), Bridge::Stv0600);
+    framer.SetFrameHandler(cap.Handler());
+
+    const auto bad = BuildIsoPacket({
+        {chunk::kSof0, {}},
+        {chunk::kData0, Ramp(kFrameBytes + 12)},
+        {chunk::kEof0, {}},
+    });
+    framer.FeedPacket(bad.data(), bad.size());
+
+    const auto good = BuildIsoPacket({
+        {chunk::kSof0, {}},
+        {chunk::kData0, Ramp(kFrameBytes)},
+        {chunk::kEof0, {}},
+    });
+    framer.FeedPacket(good.data(), good.size());
+
+    CHECK_EQ(cap.frames.size(), size_t{1});
+    if (cap.frames.empty()) return;
+    CHECK_EQ(cap.complete[0], true);
+    CHECK_EQ(framer.stats().frames_overrun, uint64_t{1});
 }
 
 TEST(FramerRejectsChunkLongerThanItsPacket) {

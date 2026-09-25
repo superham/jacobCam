@@ -115,6 +115,7 @@ if(WIN32)
 
     # Media Foundation virtual camera source.
     add_library(qcamvcam SHARED
+        src/qcamvcam/activate.cpp
         src/qcamvcam/dllmain.cpp
         src/qcamvcam/media_source.cpp
         src/qcamvcam/media_stream.cpp)

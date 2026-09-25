@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "qcam/decode.h"
+#include "qcam/ring.h"
 
 using namespace qcam;
 
@@ -337,4 +338,65 @@ TEST(WhiteBalanceHoldsStillOnABlackFrame) {
     // Nothing to measure: the gains must not run away chasing noise.
     CHECK_NEAR(wb.red_gain(), 1.0f, 0.001f);
     CHECK_NEAR(wb.blue_gain(), 1.0f, 0.001f);
+}
+
+TEST(ScaleNv12SameSizeIsACopy) {
+    std::vector<uint8_t> src(8 * 4 * 3 / 2);
+    for (size_t i = 0; i < src.size(); ++i) src[i] = static_cast<uint8_t>(i * 7);
+    std::vector<uint8_t> dst(src.size(), 0);
+    ScaleNv12(src.data(), 8, 4, dst.data(), 8, 4);
+    CHECK(src == dst);
+}
+
+TEST(ScaleNv12KeepsAUniformImageUniform) {
+    // Native sensor size up to VGA: every output sample must stay put.
+    const uint16_t sw = 360, sh = 296, dw = 640, dh = 480;
+    std::vector<uint8_t> src(sw * sh * 3 / 2);
+    std::fill(src.begin(), src.begin() + sw * sh, uint8_t{90});
+    for (size_t i = sw * sh; i < src.size(); i += 2) { src[i] = 100; src[i + 1] = 160; }
+    std::vector<uint8_t> dst(dw * dh * 3 / 2, 0);
+    ScaleNv12(src.data(), sw, sh, dst.data(), dw, dh);
+    for (size_t i = 0; i < size_t{dw} * dh; ++i) CHECK_EQ(dst[i], 90);
+    for (size_t i = size_t{dw} * dh; i < dst.size(); i += 2) {
+        CHECK_EQ(dst[i], 100);
+        CHECK_EQ(dst[i + 1], 160);
+    }
+}
+
+TEST(ScaleNv12CropsToTheTargetAspectRatio) {
+    // A 4:3 target from a taller source: the outer rows (marked 0) must be
+    // cropped away, never squeezed into the picture. 12 rows to 6 leaves a
+    // 3-row margin each side; the crop origin rounds down to an even row for
+    // chroma, so only the outer two rows are guaranteed to go.
+    const uint16_t sw = 8, sh = 12, dw = 8, dh = 6;
+    std::vector<uint8_t> src(sw * sh * 3 / 2, 128);
+    for (int y = 0; y < sh; ++y) {
+        const bool edge = y < 2 || y >= sh - 2;
+        for (int x = 0; x < sw; ++x) src[y * sw + x] = edge ? 0 : 200;
+    }
+    std::vector<uint8_t> dst(dw * dh * 3 / 2, 0);
+    ScaleNv12(src.data(), sw, sh, dst.data(), dw, dh);
+    for (size_t i = 0; i < size_t{dw} * dh; ++i) CHECK_EQ(dst[i], 200);
+}
+
+TEST(PictureControlDefaultsMatchColourDefaults) {
+    const ColorSettings defaults;
+    ColorSettings mapped;
+    ApplyPictureControls(PictureControls{}, &mapped);
+    CHECK_NEAR(mapped.brightness, defaults.brightness, 1e-6f);
+    CHECK_NEAR(mapped.contrast, defaults.contrast, 1e-6f);
+    CHECK_NEAR(mapped.saturation, defaults.saturation, 1e-6f);
+    CHECK_NEAR(mapped.gamma, defaults.gamma, 1e-6f);
+}
+
+TEST(PictureControlsMapOntoTheDecoderRange) {
+    PictureControls p;
+    p.brightness = 100;
+    p.contrast   = 150;
+    ColorSettings c;
+    c.auto_white_balance = false;
+    ApplyPictureControls(p, &c);
+    CHECK_NEAR(c.brightness, 0.5f, 1e-6f);
+    CHECK_NEAR(c.contrast, 1.5f, 1e-6f);
+    CHECK(!c.auto_white_balance);  // untouched
 }

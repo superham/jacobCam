@@ -3,7 +3,9 @@
 
 #include <mferror.h>
 
+#include <algorithm>
 #include <new>
+#include <vector>
 
 #include "qcam/log.h"
 
@@ -59,7 +61,13 @@ HRESULT QcamMediaSource::CheckShutdown() const {
     return shutdown_ ? MF_E_SHUTDOWN : S_OK;
 }
 
-HRESULT QcamMediaSource::CreateMediaType(IMFMediaType** out) const {
+bool QcamMediaSource::IsShutdown() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return shutdown_;
+}
+
+HRESULT QcamMediaSource::CreateMediaType(UINT32 width, UINT32 height,
+                                         IMFMediaType** out) const {
     if (!out) return E_POINTER;
     *out = nullptr;
 
@@ -72,7 +80,7 @@ HRESULT QcamMediaSource::CreateMediaType(IMFMediaType** out) const {
     hr = type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
     if (FAILED(hr)) return hr;
 
-    hr = MFSetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, width_, height_);
+    hr = MFSetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, width, height);
     if (FAILED(hr)) return hr;
     hr = MFSetAttributeRatio(type.Get(), MF_MT_FRAME_RATE, fps_num_, fps_den_);
     if (FAILED(hr)) return hr;
@@ -84,12 +92,12 @@ HRESULT QcamMediaSource::CreateMediaType(IMFMediaType** out) const {
     hr = type->SetUINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, TRUE);
     if (FAILED(hr)) return hr;
     // NV12 here is packed, so the stride is just the width.
-    hr = type->SetUINT32(MF_MT_DEFAULT_STRIDE, width_);
+    hr = type->SetUINT32(MF_MT_DEFAULT_STRIDE, width);
     if (FAILED(hr)) return hr;
     hr = type->SetUINT32(MF_MT_SAMPLE_SIZE,
                          static_cast<UINT32>(ImageSize(PixelFormat::Nv12,
-                                                       static_cast<uint16_t>(width_),
-                                                       static_cast<uint16_t>(height_))));
+                                                       static_cast<uint16_t>(width),
+                                                       static_cast<uint16_t>(height))));
     if (FAILED(hr)) return hr;
     hr = type->SetUINT32(MF_MT_FIXED_SIZE_SAMPLES, TRUE);
     if (FAILED(hr)) return hr;
@@ -130,20 +138,30 @@ HRESULT QcamMediaSource::Initialize() {
     HRESULT hr = MFCreateEventQueue(&event_queue_);
     if (FAILED(hr)) return hr;
 
-    ComPtr<IMFMediaType> type;
-    hr = CreateMediaType(&type);
+    // Native size first, so it is the default; then the standard sizes the
+    // stream scales to for apps that insist on one.
+    std::vector<ComPtr<IMFMediaType>> types;
+    types.emplace_back();
+    hr = CreateMediaType(width_, height_, &types.back());
     if (FAILED(hr)) return hr;
+    for (const auto& size : kExtraSizes) {
+        if (size.width == width_ && size.height == height_) continue;
+        types.emplace_back();
+        hr = CreateMediaType(size.width, size.height, &types.back());
+        if (FAILED(hr)) return hr;
+    }
 
-    IMFMediaType* types[] = {type.Get()};
+    std::vector<IMFMediaType*> raw_types;
+    for (const auto& t : types) raw_types.push_back(t.Get());
     ComPtr<IMFStreamDescriptor> stream_descriptor;
-    hr = MFCreateStreamDescriptor(/*streamId=*/0, /*cMediaTypes=*/1, types,
-                                  &stream_descriptor);
+    hr = MFCreateStreamDescriptor(/*streamId=*/0, static_cast<DWORD>(raw_types.size()),
+                                  raw_types.data(), &stream_descriptor);
     if (FAILED(hr)) return hr;
 
     ComPtr<IMFMediaTypeHandler> handler;
     hr = stream_descriptor->GetMediaTypeHandler(&handler);
     if (FAILED(hr)) return hr;
-    hr = handler->SetCurrentMediaType(type.Get());
+    hr = handler->SetCurrentMediaType(types.front().Get());
     if (FAILED(hr)) return hr;
 
     IMFStreamDescriptor* descriptors[] = {stream_descriptor.Get()};
@@ -172,6 +190,35 @@ HRESULT QcamMediaSource::Initialize() {
                                        MFFrameSourceTypes_Color);
     if (FAILED(hr)) return hr;
 
+    // Undocumented, but the Frame Server client reads both off every stream
+    // during activation (confirmed via mftrace); leaving them unset may be
+    // read as "hidden" rather than defaulted to visible.
+    hr = stream_attributes_->SetUINT32(MF_DEVICESTREAM_FRAMESERVER_SHARED, 0);
+    if (FAILED(hr)) return hr;
+    hr = stream_attributes_->SetUINT32(MF_DEVICESTREAM_FRAMESERVER_HIDDEN, 0);
+    if (FAILED(hr)) return hr;
+
+    // The Frame Server queries this during activation, before ever starting
+    // the source, and appears to require it: without a sensor profile
+    // collection the camera activates but Start() fails with MF_E_SHUTDOWN.
+    // This camera has one fixed frame rate, so a single generic "normal
+    // speed" profile is enough; there is no high-frame-rate mode to declare.
+    {
+        ComPtr<IMFSensorProfileCollection> profiles;
+        ComPtr<IMFSensorProfile> profile;
+        hr = MFCreateSensorProfileCollection(&profiles);
+        if (FAILED(hr)) return hr;
+        hr = MFCreateSensorProfile(KSCAMERAPROFILE_Legacy, 0, nullptr, &profile);
+        if (FAILED(hr)) return hr;
+        hr = profile->AddProfileFilter(/*streamId=*/0, L"((RES==;FRT<=30,1;SUT==))");
+        if (FAILED(hr)) return hr;
+        hr = profiles->AddProfile(profile.Get());
+        if (FAILED(hr)) return hr;
+        hr = source_attributes_->SetUnknown(MF_DEVICEMFT_SENSORPROFILE_COLLECTION,
+                                            profiles.Get());
+        if (FAILED(hr)) return hr;
+    }
+
     stream_ = new (std::nothrow) QcamMediaStream();
     if (!stream_) return E_OUTOFMEMORY;
 
@@ -199,9 +246,13 @@ IFACEMETHODIMP QcamMediaSource::QueryInterface(REFIID riid, void** ppv) {
         *ppv = static_cast<IMFMediaSourceEx*>(this);
     } else if (riid == IID_IMFGetService) {
         *ppv = static_cast<IMFGetService*>(this);
+    } else if (riid == IID_IMFSampleAllocatorControl) {
+        *ppv = static_cast<IMFSampleAllocatorControl*>(this);
     } else if (riid == __uuidof(IKsControl)) {
         *ppv = static_cast<IKsControl*>(this);
     } else {
+        QCAM_LOGT("QcamMediaSource: interface {%08lx-...} not implemented",
+                  (unsigned long)riid.Data1);
         return E_NOINTERFACE;
     }
     AddRef();
@@ -334,8 +385,15 @@ IFACEMETHODIMP QcamMediaSource::Start(IMFPresentationDescriptor* pd,
         PropVariantClear(&start);
     }
 
+    if (FAILED(hr))
+        QCAM_LOGE("Camera::Start: queuing the new-stream event failed: 0x%08lx",
+                  static_cast<unsigned long>(hr));
+
     // The stream queues MEStreamStarted on its own queue.
     if (SUCCEEDED(hr)) hr = stream->Start();
+    if (FAILED(hr))
+        QCAM_LOGE("Camera::Start: stream failed to start: 0x%08lx",
+                  static_cast<unsigned long>(hr));
 
     stream->Release();
     return hr;
@@ -446,6 +504,38 @@ IFACEMETHODIMP QcamMediaSource::GetService(REFGUID service, REFIID riid, LPVOID*
     return MF_E_UNSUPPORTED_SERVICE;
 }
 
+// --- IMFSampleAllocatorControl ---------------------------------------------
+
+IFACEMETHODIMP QcamMediaSource::SetDefaultAllocator(DWORD output_stream_id,
+                                                    IUnknown* allocator) {
+    if (output_stream_id != 0) return MF_E_INVALIDSTREAMNUMBER;
+
+    QcamMediaStream* stream = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        HRESULT hr = CheckShutdown();
+        if (FAILED(hr)) return hr;
+        stream = stream_;
+        if (stream) stream->AddRef();
+    }
+    if (!stream) return E_UNEXPECTED;
+    const HRESULT hr = stream->SetAllocator(allocator);
+    stream->Release();
+    return hr;
+}
+
+IFACEMETHODIMP QcamMediaSource::GetAllocatorUsage(DWORD output_stream_id,
+                                                  DWORD* input_stream_id,
+                                                  MFSampleAllocatorUsage* usage) {
+    if (!input_stream_id || !usage) return E_POINTER;
+    if (output_stream_id != 0) return MF_E_INVALIDSTREAMNUMBER;
+    // A source has no input streams; echo the output id as Microsoft's own
+    // virtual camera sample does.
+    *input_stream_id = output_stream_id;
+    *usage = MFSampleAllocatorUsage_UsesProvidedAllocator;
+    return S_OK;
+}
+
 // --- IKsControl ------------------------------------------------------------
 
 HRESULT QcamMediaSource::HandleVideoProcAmp(PKSPROPERTY property, void* data,
@@ -499,8 +589,23 @@ HRESULT QcamMediaSource::HandleVideoProcAmp(PKSPROPERTY property, void* data,
 
     auto* procamp = static_cast<PKSPROPERTY_VIDEOPROCAMP_S>(data);
 
+    // The four controls the decoder applies; gain and white balance stay
+    // automatic and just report their defaults.
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!controls_.IsOpen() && Succeeded(controls_.Open()))
+        controls_.Set(local_controls_);   // settings made while qcamsvc was down
+    PictureControls current = controls_.IsOpen() ? controls_.Get() : local_controls_;
+    int32_t* field = nullptr;
+    switch (property->Id) {
+        case KSPROPERTY_VIDEOPROCAMP_BRIGHTNESS: field = &current.brightness; break;
+        case KSPROPERTY_VIDEOPROCAMP_CONTRAST:   field = &current.contrast;   break;
+        case KSPROPERTY_VIDEOPROCAMP_SATURATION: field = &current.saturation; break;
+        case KSPROPERTY_VIDEOPROCAMP_GAMMA:      field = &current.gamma;      break;
+        default: break;
+    }
+
     if (property->Flags & KSPROPERTY_TYPE_GET) {
-        procamp->Value        = range->default_value;
+        procamp->Value        = field ? *field : range->default_value;
         procamp->Flags        = range->capabilities;
         procamp->Capabilities = range->capabilities;
         if (bytes_returned) *bytes_returned = sizeof(KSPROPERTY_VIDEOPROCAMP_S);
@@ -508,13 +613,14 @@ HRESULT QcamMediaSource::HandleVideoProcAmp(PKSPROPERTY property, void* data,
     }
 
     if (property->Flags & KSPROPERTY_TYPE_SET) {
-        // Accepted and acknowledged. Applying these means round-tripping to
-        // qcamsvc, which owns the decoder; until that control channel exists
-        // the value is reported back but does not change the picture.
-        QCAM_LOGD("VideoProcAmp set: property %lu = %ld (not yet routed to the "
-                  "capture service)",
-                  static_cast<unsigned long>(property->Id),
-                  static_cast<long>(procamp->Value));
+        if (field) {
+            *field = std::clamp(static_cast<int32_t>(procamp->Value),
+                                static_cast<int32_t>(range->min),
+                                static_cast<int32_t>(range->max));
+            local_controls_ = current;
+            // qcamsvc picks this up at its next frame.
+            if (controls_.IsOpen()) controls_.Set(current);
+        }
         if (bytes_returned) *bytes_returned = sizeof(KSPROPERTY_VIDEOPROCAMP_S);
         return S_OK;
     }

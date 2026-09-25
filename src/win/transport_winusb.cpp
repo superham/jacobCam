@@ -155,7 +155,10 @@ public:
                                       const_cast<PUCHAR>(data),
                                       static_cast<ULONG>(len), &transferred,
                                       nullptr)) {
-            return StatusFromLastError(::GetLastError());
+            const DWORD err = ::GetLastError();
+            QCAM_LOGD("control out req 0x%02x value 0x%04x failed: %lu", request,
+                      value, err);
+            return StatusFromLastError(err);
         }
         return (transferred == len) ? Status::Ok : Status::Protocol;
     }
@@ -181,8 +184,11 @@ public:
     // -- Interface state ---------------------------------------------------
 
     Status SetAltSetting(uint8_t alt) override {
-        if (!::WinUsb_SetCurrentAlternateSetting(winusb_, alt))
-            return StatusFromLastError(::GetLastError());
+        if (!::WinUsb_SetCurrentAlternateSetting(winusb_, alt)) {
+            const DWORD err = ::GetLastError();
+            QCAM_LOGE("WinUsb_SetCurrentAlternateSetting(%u) failed: %lu", alt, err);
+            return StatusFromLastError(err);
+        }
         alt_ = alt;
         QCAM_LOGD("alternate setting %u selected", alt);
         return Status::Ok;

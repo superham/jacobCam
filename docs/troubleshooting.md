@@ -26,9 +26,11 @@ pnputil /enum-drivers | Select-String -Context 3 qcam
 Get-Content C:\Windows\INF\setupapi.dev.log -Tail 80
 ```
 
-`setupapi.dev.log` names the actual reason. A signature complaint means the
-package is unsigned and the machine is not in test-signing mode — see
-`docs/installing.md`.
+`setupapi.dev.log` names the actual reason. A signature complaint usually
+means the INF was installed from somewhere without its catalog — install the
+signed copy in `C:\Program Files\qcam\driver\`, or re-run `install.ps1`, which
+re-signs it. See `docs/installing.md`. Test-signing mode is not needed and
+will not help.
 
 ## 2. Does the sensor answer?
 
@@ -150,12 +152,16 @@ qcamctl attach -t 5
 ```
 
 `attach` reads from the service's shared-memory ring, which is exactly what the
-virtual camera does. If `attach` sees frames but applications do not, the
-problem is the Media Foundation side.
+virtual camera does, and asks the service to open the camera the same way an
+app does. Run it from an **elevated** prompt: apart from administrators, only
+the Windows Frame Server may read frames. If `attach` sees frames but
+applications do not, the problem is the Media Foundation side.
 
 | Symptom | Cause |
 | --- | --- |
 | `attach` says the ring is not present | The service is not running, or it is running but could not open the camera. `qcamsvc --console -v` shows why. |
+| `attach` fails with `Busy` | The prompt is not elevated. |
+| The camera light never comes on / the service log says it is waiting | Expected when nothing is reading: the camera only streams while an app, or `attach`, asks for frames. |
 | The camera is not in any app's list | The COM server is not registered, or the DLL moved. Re-run `regsvr32 qcamvcam.dll` from where it now lives. Check `HKLM\Software\Classes\CLSID\{9BB2B860-94A0-4B47-ADF7-7F3FBCA2FB6E}\InprocServer32`. |
 | The camera is listed but shows a grey picture | The virtual camera is running and the ring has no frames. That grey frame is deliberate — it keeps conferencing apps from erroring out at open time. Check the service. |
 | The camera is listed but fails to open | The Frame Server could not load the DLL. Put it somewhere readable by `LOCAL SERVICE`; a per-user directory will not work. |

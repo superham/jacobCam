@@ -96,7 +96,33 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-// Reader side; lives in the virtual camera and in qcamctl.
+// Service side of on-demand streaming. Readers signal it every time they open
+// the ring or wait for a frame, so the service can leave the camera closed
+// until something actually wants frames, and close it again once nothing has
+// asked for a while.
+class FrameDemand {
+public:
+    FrameDemand();
+    ~FrameDemand();
+
+    FrameDemand(const FrameDemand&) = delete;
+    FrameDemand& operator=(const FrameDemand&) = delete;
+
+    Status Create();
+    void   Close();
+
+    // The auto-reset event readers signal: a HANDLE on Windows, null
+    // elsewhere or before Create() succeeds.
+    void*  wait_handle() const;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+// Reader side; lives in the virtual camera and in qcamctl. Open() and Read()
+// both tell the service a reader wants frames (see FrameDemand), so Open()
+// failing with NoDevice may simply mean the camera is still starting.
 class FrameRingReader {
 public:
     FrameRingReader();
@@ -116,6 +142,86 @@ public:
     // copies it into `out`. Returns Timeout if none arrived in time, and
     // NoDevice if the writer went away.
     Status Read(std::vector<uint8_t>* out, FrameMeta* meta, uint32_t timeout_ms);
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+// Picture controls apps change through the virtual camera, in the units of
+// the standard VideoProcAmp properties they arrive as. The defaults match
+// ColorSettings' defaults.
+struct PictureControls {
+    int32_t brightness = 0;    // -100 .. 100
+    int32_t contrast   = 100;  // percent, 20 .. 200
+    int32_t saturation = 115;  // percent, 0 .. 200
+    int32_t gamma      = 65;   // gamma x 100, 20 .. 300
+};
+
+// Maps the controls onto the decoder's colour settings, leaving everything
+// else (white balance, flips) as it was.
+inline void ApplyPictureControls(const PictureControls& p, ColorSettings* c) {
+    // Full slider travel is half the decoder's range: +-1.0 there is solid
+    // white or black, which no one wants from a brightness slider.
+    c->brightness = static_cast<float>(p.brightness) / 200.0f;
+    c->contrast   = static_cast<float>(p.contrast) / 100.0f;
+    c->saturation = static_cast<float>(p.saturation) / 100.0f;
+    c->gamma      = static_cast<float>(p.gamma) / 100.0f;
+}
+
+constexpr uint32_t kControlMagic   = 0x4c544351;  // 'QCTL'
+constexpr uint32_t kControlVersion = 1;
+
+struct ControlBlock {
+    uint32_t magic;
+    uint32_t version;
+    std::atomic<uint32_t> generation;   // bumped after every change
+    std::atomic<int32_t>  brightness;
+    std::atomic<int32_t>  contrast;
+    std::atomic<int32_t>  saturation;
+    std::atomic<int32_t>  gamma;
+};
+
+// Service side of the picture controls. Created once for the service's
+// lifetime, not per stream, so a setting survives the camera being closed
+// and reopened between apps.
+class PictureControlHost {
+public:
+    PictureControlHost();
+    ~PictureControlHost();
+
+    PictureControlHost(const PictureControlHost&) = delete;
+    PictureControlHost& operator=(const PictureControlHost&) = delete;
+
+    Status Create(const PictureControls& initial);
+    void   Close();
+
+    PictureControls Current() const;
+    // True, with the new values, when a client changed them since the last
+    // call. Cheap enough to call on every frame.
+    bool Poll(PictureControls* out);
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+// Virtual camera side: reads the current values for apps' settings panels
+// and writes their changes.
+class PictureControlClient {
+public:
+    PictureControlClient();
+    ~PictureControlClient();
+
+    PictureControlClient(const PictureControlClient&) = delete;
+    PictureControlClient& operator=(const PictureControlClient&) = delete;
+
+    // NoDevice when the service is not running.
+    Status Open();
+    bool   IsOpen() const;
+
+    PictureControls Get() const;
+    Status Set(const PictureControls& controls);
 
 private:
     struct Impl;

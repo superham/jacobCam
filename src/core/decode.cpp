@@ -502,4 +502,61 @@ Status Decoder::Convert(const uint8_t* bayer, size_t bayer_len,
     return Status::Ok;
 }
 
+namespace {
+
+// Bilinear resample of one plane of `channels` interleaved bytes per sample,
+// reading the window (x0, y0, cw, ch) of a `stride`-byte-wide source.
+void ResamplePlane(const uint8_t* src, int stride, int x0, int y0, int cw, int ch,
+                   uint8_t* dst, int dw, int dh, int channels) {
+    for (int y = 0; y < dh; ++y) {
+        // Pixel-centre mapping, so the image does not drift by half a pixel.
+        const float fy = std::clamp((y + 0.5f) * ch / dh - 0.5f, 0.0f, ch - 1.0f);
+        const int   iy = static_cast<int>(fy);
+        const int   iy1 = std::min(iy + 1, ch - 1);
+        const float wy = fy - iy;
+        const uint8_t* r0 = src + static_cast<size_t>(y0 + iy) * stride;
+        const uint8_t* r1 = src + static_cast<size_t>(y0 + iy1) * stride;
+        uint8_t* out = dst + static_cast<size_t>(y) * dw * channels;
+        for (int x = 0; x < dw; ++x) {
+            const float fx = std::clamp((x + 0.5f) * cw / dw - 0.5f, 0.0f, cw - 1.0f);
+            const int   ix = static_cast<int>(fx);
+            const int   ix1 = std::min(ix + 1, cw - 1);
+            const float wx = fx - ix;
+            const int a = (x0 + ix) * channels, b = (x0 + ix1) * channels;
+            for (int c = 0; c < channels; ++c) {
+                const float top = r0[a + c] + (r0[b + c] - r0[a + c]) * wx;
+                const float bot = r1[a + c] + (r1[b + c] - r1[a + c]) * wx;
+                out[x * channels + c] = ClampU8f(top + (bot - top) * wy);
+            }
+        }
+    }
+}
+
+}  // namespace
+
+void ScaleNv12(const uint8_t* src, uint16_t src_w, uint16_t src_h,
+               uint8_t* dst, uint16_t dst_w, uint16_t dst_h) {
+    if (src_w == dst_w && src_h == dst_h) {
+        std::memcpy(dst, src, static_cast<size_t>(src_w) * src_h * 3 / 2);
+        return;
+    }
+
+    // Largest window of the source with the destination's aspect ratio,
+    // centred. Kept even so it lines up with the 2x2 chroma sites.
+    int cw = src_w, ch = src_h;
+    if (static_cast<long>(src_w) * dst_h > static_cast<long>(src_h) * dst_w)
+        cw = static_cast<int>(static_cast<long>(src_h) * dst_w / dst_h);
+    else
+        ch = static_cast<int>(static_cast<long>(src_w) * dst_h / dst_w);
+    cw &= ~1;
+    ch &= ~1;
+    const int x0 = ((src_w - cw) / 2) & ~1;
+    const int y0 = ((src_h - ch) / 2) & ~1;
+
+    ResamplePlane(src, src_w, x0, y0, cw, ch, dst, dst_w, dst_h, 1);
+    ResamplePlane(src + static_cast<size_t>(src_w) * src_h, src_w, x0 / 2, y0 / 2,
+                  cw / 2, ch / 2, dst + static_cast<size_t>(dst_w) * dst_h,
+                  dst_w / 2, dst_h / 2, 2);
+}
+
 }  // namespace qcam

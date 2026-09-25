@@ -29,8 +29,18 @@ DEFINE_GUID(CLSID_QcamActivator,
 // Shared-memory object names used between qcamsvc and the virtual camera.
 #define QCAM_RING_NAME    L"Global\\qcam.frames.4EA75BBB"
 #define QCAM_RING_EVENT   L"Global\\qcam.frame.4EA75BBB"
+#define QCAM_DEMAND_EVENT L"Global\\qcam.demand.4EA75BBB"
 #define QCAM_RING_MUTEX   L"Global\\qcam.lock.4EA75BBB"
+#define QCAM_CONTROLS_NAME L"Global\\qcam.controls.4EA75BBB"
 #define QCAM_CONTROL_PIPE L"\\\\.\\pipe\\qcam.control.4EA75BBB"
+
+// The per-service SID qcamsvc runs with. It is the only non-administrator
+// principal allowed to write the frame ring.
+#define QCAM_SERVICE_ACCOUNT L"NT SERVICE\\qcamsvc"
+
+// The Windows Camera Frame Server, which hosts qcamvcam.dll. It is the only
+// non-administrator principal allowed to read frames.
+#define QCAM_READER_ACCOUNT  L"NT SERVICE\\FrameServer"
 
 #endif  // _WIN32
 #endif  // QCAM_WIN_GUIDS_H_

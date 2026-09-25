@@ -105,6 +105,7 @@ private:
     size_t               configured_skip_ = 0;
     size_t               skip_remaining_  = 0;
     bool                 in_frame_        = false;
+    bool                 overran_         = false;
     bool                 emit_short_      = true;
     uint64_t             sequence_        = 0;
     FramerStats          stats_;

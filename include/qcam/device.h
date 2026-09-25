@@ -53,6 +53,7 @@ struct DecodedFrame {
     uint16_t       height;
     uint64_t       sequence;
     uint64_t       timestamp_100ns;
+    bool           complete;         // false => short frame, tail padded grey
 };
 
 struct CameraStats {

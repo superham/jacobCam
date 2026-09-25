@@ -22,8 +22,8 @@ namespace qcam {
 enum class VCamLifetime {
     // Lives as long as the registering process holds it. Good for debugging.
     Session,
-    // Survives process exit and reboot until explicitly removed. This is what
-    // the service uses so the camera is present at the sign-in screen.
+    // Survives process exit and reboot until explicitly removed. The installer
+    // registers one of these so the camera is present at the sign-in screen.
     System,
 };
 
@@ -50,9 +50,16 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-// Removes a previously registered System-lifetime virtual camera. Safe to
-// call when none is registered.
-Status RemoveVirtualCamera();
+// Registers and starts a System-lifetime virtual camera, then lets go of it
+// without stopping it, so it stays in app pickers after this process exits.
+// Needs administrator rights; the installer calls it once, which is what lets
+// the service itself run without them.
+Status RegisterPersistentVirtualCamera(const std::wstring& friendly_name);
+
+// Removes a previously registered System-lifetime virtual camera. Pass the
+// same friendly name it was registered with. Safe to call when none is
+// registered.
+Status RemoveVirtualCamera(const std::wstring& friendly_name);
 
 // True when this Windows build has the virtual camera API at all.
 bool VirtualCameraSupported();

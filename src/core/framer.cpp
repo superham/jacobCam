@@ -43,6 +43,7 @@ void ChunkFramer::Configure(const FrameGeometry& geom, Bridge bridge) {
 void ChunkFramer::Reset() {
     filled_         = 0;
     in_frame_       = false;
+    overran_        = false;
     skip_remaining_ = 0;
     stats_          = FramerStats{};
 }
@@ -50,6 +51,7 @@ void ChunkFramer::Reset() {
 void ChunkFramer::BeginFrame() {
     filled_         = 0;
     in_frame_       = true;
+    overran_        = false;
     skip_remaining_ = configured_skip_;
 }
 
@@ -72,9 +74,13 @@ void ChunkFramer::AppendData(const uint8_t* data, size_t len) {
 
     const size_t room = accum_.size() - filled_;
     if (len > room) {
-        // The sensor produced more than the geometry says it should. Keep what
-        // fits so the frame is still usable and flag it.
-        stats_.frames_overrun++;
+        // More data than the geometry allows. On real hardware this happens
+        // when exposure is reprogrammed mid-frame, and the extra bytes are not
+        // just a tail: clipping yields a frame shifted by an odd byte count,
+        // which shows as a vertical seam with swapped Bayer colours. EndFrame
+        // drops it, as gspca does.
+        if (!overran_) stats_.frames_overrun++;
+        overran_ = true;
         stats_.bytes_dropped += len - room;
         len = room;
     }
@@ -89,6 +95,14 @@ void ChunkFramer::EndFrame() {
     in_frame_ = false;
 
     const size_t want = accum_.size();
+
+    if (overran_) {
+        QCAM_LOGD("framer: dropping overrun frame");
+        overran_ = false;
+        filled_  = 0;
+        return;
+    }
+
     const bool complete = (filled_ == want);
 
     if (!complete) {

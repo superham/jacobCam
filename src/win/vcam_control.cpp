@@ -39,6 +39,31 @@ std::wstring SourceClsidString() {
     return buffer;
 }
 
+// MFCreateVirtualCamera talks to the Frame Server over COM and needs Media
+// Foundation started on the calling thread. The one-shot register/remove
+// commands run on a bare main thread, so they set both up themselves.
+class ScopedMediaFoundation {
+public:
+    ScopedMediaFoundation() {
+        const HRESULT co = ::CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        // RPC_E_CHANGED_MODE: COM is already up in another apartment, which
+        // is fine to use but not ours to tear down.
+        com_ = SUCCEEDED(co);
+        mf_ = SUCCEEDED(::MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET));
+    }
+    ~ScopedMediaFoundation() {
+        if (mf_) ::MFShutdown();
+        if (com_) ::CoUninitialize();
+    }
+
+    ScopedMediaFoundation(const ScopedMediaFoundation&) = delete;
+    ScopedMediaFoundation& operator=(const ScopedMediaFoundation&) = delete;
+
+private:
+    bool com_ = false;
+    bool mf_  = false;
+};
+
 }  // namespace
 
 struct VirtualCamera::Impl {
@@ -138,17 +163,49 @@ void VirtualCamera::Close() {
     if (impl_) impl_->Release();
 }
 
-Status RemoveVirtualCamera() {
+Status RegisterPersistentVirtualCamera(const std::wstring& friendly_name) {
     if (!VirtualCameraSupported()) return Status::Unsupported;
 
-    // Re-create a handle to the same registration so it can be removed. A
-    // System-lifetime camera outlives whichever process registered it.
+    ScopedMediaFoundation mf;
     IMFVirtualCamera* camera = nullptr;
     const std::wstring clsid = SourceClsidString();
     HRESULT hr = ::MFCreateVirtualCamera(MFVirtualCameraType_SoftwareCameraSource,
                                          MFVirtualCameraLifetime_System,
                                          MFVirtualCameraAccess_AllUsers,
-                                         L"qcam QuickCam Express",
+                                         friendly_name.c_str(), clsid.c_str(),
+                                         nullptr, 0, &camera);
+    if (FAILED(hr)) {
+        QCAM_LOGE("MFCreateVirtualCamera failed: 0x%08lx (run as administrator)",
+                  static_cast<unsigned long>(hr));
+        return StatusFromHr(hr);
+    }
+
+    // Release without Stop(): stopping would disable the registration that
+    // this call exists to leave behind.
+    hr = camera->Start(nullptr);
+    camera->Release();
+    if (FAILED(hr)) {
+        QCAM_LOGE("IMFVirtualCamera::Start failed: 0x%08lx",
+                  static_cast<unsigned long>(hr));
+        return StatusFromHr(hr);
+    }
+    QCAM_LOGI("virtual camera registered against source %ls", clsid.c_str());
+    return Status::Ok;
+}
+
+Status RemoveVirtualCamera(const std::wstring& friendly_name) {
+    if (!VirtualCameraSupported()) return Status::Unsupported;
+
+    ScopedMediaFoundation mf;
+    // Re-create a handle to the same registration so it can be removed. A
+    // System-lifetime camera outlives whichever process registered it. Every
+    // argument, the name included, has to match the registration's.
+    IMFVirtualCamera* camera = nullptr;
+    const std::wstring clsid = SourceClsidString();
+    HRESULT hr = ::MFCreateVirtualCamera(MFVirtualCameraType_SoftwareCameraSource,
+                                         MFVirtualCameraLifetime_System,
+                                         MFVirtualCameraAccess_AllUsers,
+                                         friendly_name.c_str(),
                                          clsid.c_str(), nullptr, 0, &camera);
     if (FAILED(hr)) return StatusFromHr(hr);
 

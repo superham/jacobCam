@@ -59,6 +59,11 @@ HRESULT QcamMediaStream::Shutdown() {
 
     std::lock_guard<std::mutex> lock(mutex_);
     pending_.clear();
+    if (allocator_) {
+        if (allocator_ready_) allocator_->UninitializeSampleAllocator();
+        allocator_.Reset();
+        allocator_ready_ = false;
+    }
     if (event_queue_) {
         event_queue_->Shutdown();
         event_queue_.Reset();
@@ -80,6 +85,8 @@ IFACEMETHODIMP QcamMediaStream::QueryInterface(REFIID riid, void** ppv) {
         riid == IID_IMFMediaStream || riid == IID_IMFMediaStream2) {
         *ppv = static_cast<IMFMediaStream2*>(this);
     } else {
+        QCAM_LOGT("QcamMediaStream: interface {%08lx-...} not implemented",
+                  (unsigned long)riid.Data1);
         return E_NOINTERFACE;
     }
     AddRef();
@@ -208,6 +215,7 @@ HRESULT QcamMediaStream::Start() {
         if (state_ == MF_STREAM_STATE_RUNNING) return S_OK;
         state_ = MF_STREAM_STATE_RUNNING;
         next_timestamp_ = 0;
+        UpdateOutputSize();
 
         if (!ring_open_) {
             // The service may not be running yet. That is not fatal: the
@@ -218,13 +226,30 @@ HRESULT QcamMediaStream::Start() {
                 QCAM_LOGW("frame ring unavailable; emitting blank frames");
         }
 
+        if (allocator_ && !allocator_ready_) {
+            ComPtr<IMFMediaTypeHandler> handler;
+            ComPtr<IMFMediaType> type;
+            HRESULT hr = descriptor_ ? descriptor_->GetMediaTypeHandler(&handler) : E_UNEXPECTED;
+            if (SUCCEEDED(hr)) hr = handler->GetCurrentMediaType(&type);
+            // A handful of samples in flight is plenty at under 8 fps.
+            if (SUCCEEDED(hr)) hr = allocator_->InitializeSampleAllocator(8, type.Get());
+            allocator_ready_ = SUCCEEDED(hr);
+            if (FAILED(hr))
+                QCAM_LOGE("initialising the Frame Server's sample allocator failed: 0x%08lx",
+                          static_cast<unsigned long>(hr));
+        }
+
         if (!worker_.joinable()) {
             worker_stop_.store(false);
             worker_ = std::thread([this] { WorkerLoop(); });
         }
     }
     ::SetEvent(work_event_);
-    return QueueEvent(MEStreamStarted, GUID_NULL, S_OK, nullptr);
+    const HRESULT hr = QueueEvent(MEStreamStarted, GUID_NULL, S_OK, nullptr);
+    if (FAILED(hr))
+        QCAM_LOGE("QcamMediaStream::Start: QueueEvent(MEStreamStarted) failed 0x%08lx",
+                  static_cast<unsigned long>(hr));
+    return hr;
 }
 
 HRESULT QcamMediaStream::Pause() {
@@ -244,6 +269,46 @@ HRESULT QcamMediaStream::StopStream() {
         pending_.clear();
     }
     return QueueEvent(MEStreamStopped, GUID_NULL, S_OK, nullptr);
+}
+
+HRESULT QcamMediaStream::SetAllocator(IUnknown* allocator) {
+    ComPtr<IMFVideoSampleAllocatorEx> video_allocator;
+    if (allocator) {
+        const HRESULT hr = allocator->QueryInterface(IID_PPV_ARGS(&video_allocator));
+        if (FAILED(hr)) return hr;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (shutdown_) return MF_E_SHUTDOWN;
+    if (allocator_ && allocator_ready_) allocator_->UninitializeSampleAllocator();
+    allocator_ = video_allocator;
+    allocator_ready_ = false;
+    return S_OK;
+}
+
+void QcamMediaStream::UpdateOutputSize() {
+    // mutex_ is held by the caller.
+    ComPtr<IMFMediaTypeHandler> handler;
+    ComPtr<IMFMediaType> type;
+    UINT32 w = 0, h = 0;
+    if (!descriptor_ || FAILED(descriptor_->GetMediaTypeHandler(&handler)) ||
+        FAILED(handler->GetCurrentMediaType(&type)) ||
+        FAILED(MFGetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, &w, &h)) || !w || !h) {
+        return;
+    }
+    if (w == width_ && h == height_) return;
+
+    width_  = w;
+    height_ = h;
+    frame_bytes_ = ImageSize(PixelFormat::Nv12, static_cast<uint16_t>(w),
+                             static_cast<uint16_t>(h));
+    // A frame kept for repeating is the old size; the allocator's samples
+    // are too, so re-initialise it for the new type.
+    last_frame_.clear();
+    if (allocator_ && allocator_ready_) {
+        allocator_->UninitializeSampleAllocator();
+        allocator_ready_ = false;
+    }
+    QCAM_LOGI("app selected %ux%u", w, h);
 }
 
 HRESULT QcamMediaStream::SetRate(float) {
@@ -283,9 +348,21 @@ HRESULT QcamMediaStream::DeliverSample(IUnknown* token) {
     HRESULT hr = CreateSampleFromRing(&sample);
     if (hr == MF_E_SHUTDOWN) return hr;
     if (FAILED(hr) || !sample) {
-        // No frame available. Send a blank one so the consumer's pipeline
-        // keeps ticking rather than stalling on a missing sample.
-        hr = CreateBlankSample(&sample);
+        // No new frame in time. Pace the stand-in at the frame rate: answering
+        // at once would flood the consumer with hundreds of frames a second
+        // while the service is still starting the camera.
+        const LONGLONG due = last_fill_time_ + frame_duration_100ns_;
+        const LONGLONG now = MFGetSystemTime();
+        if (last_fill_time_ && now < due)
+            ::Sleep(static_cast<DWORD>((due - now) / 10'000));
+        last_fill_time_ = MFGetSystemTime();
+
+        // Repeat the last real frame if there is one: in low light the camera
+        // runs well under its nominal rate, and a grey frame between two real
+        // ones reads as flicker. Grey only until the first frame arrives.
+        hr = last_frame_.empty()
+                 ? CreateBlankSample(&sample)
+                 : WrapBuffer(last_frame_.data(), last_frame_.size(), next_timestamp_, &sample);
         if (FAILED(hr)) return hr;
     }
 
@@ -325,12 +402,11 @@ HRESULT QcamMediaStream::CreateSampleFromRing(IMFSample** out) {
 
     std::vector<uint8_t> frame;
     FrameMeta meta;
-    // Wait about two frame intervals: long enough to actually catch the next
-    // frame at 7.5 fps, short enough that a stalled service does not hang the
-    // Frame Server's request.
-    const uint32_t timeout_ms =
-        static_cast<uint32_t>(frame_duration_100ns_ / 10'000 * 2 + 50);
-    const Status st = ring_.Read(&frame, &meta, timeout_ms);
+    // Low light stretches exposure past the frame period and the camera drops
+    // to a few frames a second, so allow well over the nominal interval
+    // before falling back to repeating the last frame.
+    constexpr uint32_t kFrameWaitMs = 1000;
+    const Status st = ring_.Read(&frame, &meta, kFrameWaitMs);
 
     if (st == Status::NoDevice) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -340,16 +416,26 @@ HRESULT QcamMediaStream::CreateSampleFromRing(IMFSample** out) {
     }
     if (Failed(st)) return E_PENDING;
 
-    if (frame.size() != frame_bytes_) {
-        // The service is publishing a different size than we advertised.
-        // Sending it anyway would corrupt the consumer's buffer.
-        QCAM_LOGW("ring frame is %zu bytes, expected %zu; check that qcamsvc "
-                  "and the virtual camera agree on --size",
-                  frame.size(), frame_bytes_);
+    if (meta.format != PixelFormat::Nv12 || (meta.width & 1) || (meta.height & 1) ||
+        frame.size() != ImageSize(PixelFormat::Nv12, static_cast<uint16_t>(meta.width),
+                                  static_cast<uint16_t>(meta.height))) {
+        QCAM_LOGW("ring frame %ux%u (%zu bytes) is not usable NV12", meta.width,
+                  meta.height, frame.size());
         return E_PENDING;
     }
 
-    return WrapBuffer(frame.data(), frame.size(), next_timestamp_, out);
+    // The ring carries the native size; scale to the one the app picked.
+    if (meta.width != width_ || meta.height != height_) {
+        scaled_.resize(frame_bytes_);
+        ScaleNv12(frame.data(), static_cast<uint16_t>(meta.width),
+                  static_cast<uint16_t>(meta.height), scaled_.data(),
+                  static_cast<uint16_t>(width_), static_cast<uint16_t>(height_));
+        frame.swap(scaled_);
+    }
+
+    const HRESULT hr = WrapBuffer(frame.data(), frame.size(), next_timestamp_, out);
+    if (SUCCEEDED(hr)) last_frame_ = std::move(frame);
+    return hr;
 }
 
 HRESULT QcamMediaStream::CreateBlankSample(IMFSample** out) {
@@ -367,38 +453,111 @@ HRESULT QcamMediaStream::CreateBlankSample(IMFSample** out) {
     return WrapBuffer(blank.data(), blank.size(), next_timestamp_, out);
 }
 
+HRESULT QcamMediaStream::CopyIntoAllocatedSample(IMFVideoSampleAllocatorEx* allocator,
+                                                 const uint8_t* data, size_t size,
+                                                 IMFSample** out) {
+    ComPtr<IMFSample> sample;
+    HRESULT hr = allocator->AllocateSample(&sample);
+    // Every sample is still with the consumer; give it a moment to return one.
+    for (int tries = 0; hr == MF_E_SAMPLEALLOCATOR_EMPTY && tries < 20; ++tries) {
+        ::Sleep(10);
+        hr = allocator->AllocateSample(&sample);
+    }
+    if (FAILED(hr)) return hr;
+
+    ComPtr<IMFMediaBuffer> buffer;
+    hr = sample->GetBufferByIndex(0, &buffer);
+    if (FAILED(hr)) return hr;
+
+    ComPtr<IMF2DBuffer2> buffer2d;
+    if (SUCCEEDED(buffer.As(&buffer2d))) {
+        // The allocator's buffers are pitched; copy row by row. NV12 in a 2D
+        // buffer is the Y plane followed by the interleaved UV plane, both at
+        // the same pitch.
+        BYTE* scanline0 = nullptr;
+        LONG  pitch = 0;
+        BYTE* start = nullptr;
+        DWORD length = 0;
+        hr = buffer2d->Lock2DSize(MF2DBuffer_LockFlags_Write, &scanline0, &pitch,
+                                  &start, &length);
+        if (FAILED(hr)) return hr;
+        const uint8_t* src = data;
+        for (UINT32 y = 0; y < height_; ++y, src += width_)
+            std::memcpy(scanline0 + static_cast<ptrdiff_t>(pitch) * y, src, width_);
+        BYTE* uv = scanline0 + static_cast<ptrdiff_t>(pitch) * height_;
+        for (UINT32 y = 0; y < height_ / 2; ++y, src += width_)
+            std::memcpy(uv + static_cast<ptrdiff_t>(pitch) * y, src, width_);
+        buffer2d->Unlock2D();
+    } else {
+        BYTE* dst = nullptr;
+        DWORD max_len = 0;
+        hr = buffer->Lock(&dst, &max_len, nullptr);
+        if (FAILED(hr)) return hr;
+        if (max_len < size) {
+            buffer->Unlock();
+            return E_UNEXPECTED;
+        }
+        std::memcpy(dst, data, size);
+        buffer->Unlock();
+        hr = buffer->SetCurrentLength(static_cast<DWORD>(size));
+        if (FAILED(hr)) return hr;
+    }
+
+    *out = sample.Detach();
+    return S_OK;
+}
+
 HRESULT QcamMediaStream::WrapBuffer(const uint8_t* data, size_t size,
                                     LONGLONG timestamp, IMFSample** out) {
-    ComPtr<IMFMediaBuffer> buffer;
-    HRESULT hr = MFCreateMemoryBuffer(static_cast<DWORD>(size), &buffer);
-    if (FAILED(hr)) return hr;
-
-    BYTE* dst = nullptr;
-    DWORD max_len = 0;
-    hr = buffer->Lock(&dst, &max_len, nullptr);
-    if (FAILED(hr)) return hr;
-    if (max_len < size) {
-        buffer->Unlock();
-        return E_UNEXPECTED;
+    ComPtr<IMFVideoSampleAllocatorEx> allocator;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (allocator_ready_) allocator = allocator_;
     }
-    std::memcpy(dst, data, size);
-    buffer->Unlock();
-
-    hr = buffer->SetCurrentLength(static_cast<DWORD>(size));
-    if (FAILED(hr)) return hr;
 
     ComPtr<IMFSample> sample;
-    hr = MFCreateSample(&sample);
-    if (FAILED(hr)) return hr;
+    HRESULT hr;
+    if (allocator) {
+        hr = CopyIntoAllocatedSample(allocator.Get(), data, size, &sample);
+        if (FAILED(hr)) return hr;
+    } else {
+        // No Frame Server allocator (e.g. an in-process consumer): plain
+        // system-memory buffer.
+        ComPtr<IMFMediaBuffer> buffer;
+        hr = MFCreateMemoryBuffer(static_cast<DWORD>(size), &buffer);
+        if (FAILED(hr)) return hr;
 
-    hr = sample->AddBuffer(buffer.Get());
-    if (FAILED(hr)) return hr;
+        BYTE* dst = nullptr;
+        DWORD max_len = 0;
+        hr = buffer->Lock(&dst, &max_len, nullptr);
+        if (FAILED(hr)) return hr;
+        if (max_len < size) {
+            buffer->Unlock();
+            return E_UNEXPECTED;
+        }
+        std::memcpy(dst, data, size);
+        buffer->Unlock();
 
-    // Timestamps are synthesised from the advertised frame rate rather than
-    // taken from the capture clock: the ring's timestamps come from a
-    // different process and a monotonic, evenly spaced series is what
-    // downstream encoders want.
-    hr = sample->SetSampleTime(timestamp);
+        hr = buffer->SetCurrentLength(static_cast<DWORD>(size));
+        if (FAILED(hr)) return hr;
+
+        hr = MFCreateSample(&sample);
+        if (FAILED(hr)) return hr;
+
+        hr = sample->AddBuffer(buffer.Get());
+        if (FAILED(hr)) return hr;
+    }
+
+    // A live source stamps samples on the Media Foundation system clock, which
+    // is what the Frame Server and every consumer compare against; a series
+    // starting at zero reads as hopelessly late and is dropped before it
+    // reaches the app. Kept monotonic in case the clock and the frame
+    // interval disagree.
+    (void)timestamp;
+    LONGLONG now = MFGetSystemTime();
+    if (now <= last_sample_time_) now = last_sample_time_ + 1;
+    last_sample_time_ = now;
+    hr = sample->SetSampleTime(now);
     if (FAILED(hr)) return hr;
     hr = sample->SetSampleDuration(frame_duration_100ns_);
     if (FAILED(hr)) return hr;

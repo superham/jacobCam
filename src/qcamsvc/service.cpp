@@ -21,6 +21,22 @@ constexpr wchar_t kServiceDisplay[] = L"qcam QuickCam Express frame broker";
 // How long to wait before looking for the camera again when it is absent.
 constexpr DWORD kRetryDelayMs = 3000;
 
+// How often a streaming service checks for an unplugged camera and for
+// readers having gone away.
+constexpr DWORD kStreamingPollMs = 1000;
+
+// How long the camera stays open after the last reader asked for a frame.
+// Long enough to ride out an app briefly pausing its pipeline (switching
+// resolution, a call being put on hold) without re-running sensor init.
+constexpr ULONGLONG kIdleTimeoutMs = 10000;
+
+// Longest exposure that still fits in one frame period. Measured on an
+// HDCS-1000 at the default window: up to 128 the camera holds its full
+// ~7.9 fps, and every step beyond stretches the frame (255 gives ~3.2 fps).
+// Auto-exposure stops here and makes up the rest with gain, trading a noisier
+// picture in dim light for motion that stays smooth.
+constexpr int kFullRateExposureMax = 128;
+
 SERVICE_STATUS         g_status = {};
 SERVICE_STATUS_HANDLE  g_status_handle = nullptr;
 CameraService*         g_service = nullptr;
@@ -77,6 +93,15 @@ void CameraService::Stop() {
 }
 
 void CameraService::PublishFrame(const DecodedFrame& frame) {
+    // An app moved a slider. Runs on the streaming thread, so the change lands
+    // at a frame boundary.
+    PictureControls controls;
+    if (controls_.Poll(&controls)) {
+        ColorSettings color = camera_.color_settings();
+        ApplyPictureControls(controls, &color);
+        camera_.SetColorSettings(color);
+    }
+
     const Status st = ring_.Publish(frame.data, frame.size, frame.sequence,
                                     frame.timestamp_100ns);
     if (Failed(st)) {
@@ -92,11 +117,24 @@ void CameraService::PublishFrame(const DecodedFrame& frame) {
     }
 }
 
+void CameraService::ReleaseCamera() {
+    camera_.Close();
+    ring_.Close();   // readers see writer_alive drop and let go of the ring
+    published_ = 0;
+}
+
 Status CameraService::OpenAndStream(const ServiceOptions& options) {
     CameraConfig cfg;
     cfg.format     = options.format;
     cfg.out_width  = options.out_width;
     cfg.out_height = options.out_height;
+    // A short frame is padded with grey; one that ended almost at once is a
+    // solid grey frame, which an app shows as a flash. Drop them: the virtual
+    // camera repeats the previous frame instead.
+    cfg.emit_short_frames = false;
+    cfg.auto_exposure.exposure_max = kFullRateExposureMax;
+    // Whatever an app last set, including before this stream started.
+    ApplyPictureControls(controls_.Current(), &cfg.color);
 
     QCAM_TRY(camera_.OpenFirst(cfg));
 
@@ -134,17 +172,20 @@ Status CameraService::Run(const ServiceOptions& options) {
     stop_.store(false);
     if (stop_event_) ::ResetEvent(stop_event_);
 
+    // The virtual camera (console --vcam) talks to the Frame Server over COM.
+    const bool com = SUCCEEDED(::CoInitializeEx(nullptr, COINIT_MULTITHREADED));
+
     const HRESULT hr = ::MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET);
     if (FAILED(hr)) {
         QCAM_LOGE("MFStartup failed: 0x%08lx", static_cast<unsigned long>(hr));
+        if (com) ::CoUninitialize();
         return Status::Io;
     }
 
-    // Register the system-wide camera even before the device shows up, so it
-    // is present in app pickers and simply produces nothing until the camera
-    // is plugged in.
-    if (options.register_vcam) {
-        Status st = vcam_.Create(options.friendly_name, VCamLifetime::System);
+    // The installed camera is registered once by install.ps1 and outlives this
+    // process. This one is a debugging aid and disappears when we exit.
+    if (options.session_vcam) {
+        Status st = vcam_.Create(options.friendly_name, VCamLifetime::Session);
         if (Succeeded(st)) {
             st = vcam_.Start();
             if (Failed(st))
@@ -157,9 +198,44 @@ Status CameraService::Run(const ServiceOptions& options) {
         }
     }
 
+    // Stream only while something is reading. An open camera is a live feed
+    // into shared memory, so it should not be on just because it is plugged
+    // in. Readers signal the demand event on every read; see FrameDemand.
+    HANDLE demand = nullptr;
+    if (!options.always_on && stop_event_) {
+        if (Succeeded(demand_.Create()))
+            demand = static_cast<HANDLE>(demand_.wait_handle());
+        else
+            QCAM_LOGW("no demand event; streaming whenever the camera is present");
+    }
+    if (demand) QCAM_LOGI("waiting for an app to ask for frames");
+
+    // Lives as long as the service, so app settings outlast individual streams.
+    if (Failed(controls_.Create(PictureControls{})))
+        QCAM_LOGW("no picture-control block; app brightness/contrast will not apply");
+
     bool streaming = false;
+    bool demanded_ever = false;
+    ULONGLONG last_demand = 0;
     while (!stop_.load()) {
-        if (!streaming) {
+        const bool wanted =
+            !demand ||
+            (demanded_ever && ::GetTickCount64() - last_demand < kIdleTimeoutMs);
+
+        if (streaming && !camera_.IsStreaming()) {
+            // The transport dropped the stream, which on this hardware almost
+            // always means the cable came out.
+            QCAM_LOGW("stream stopped unexpectedly; releasing the device");
+            ReleaseCamera();
+            streaming = false;
+        } else if (streaming && !wanted) {
+            QCAM_LOGI("no app has asked for frames in %lu s; releasing the camera",
+                      static_cast<unsigned long>(kIdleTimeoutMs / 1000));
+            ReleaseCamera();
+            streaming = false;
+        }
+
+        if (!streaming && wanted) {
             const Status st = OpenAndStream(options);
             if (Succeeded(st)) {
                 streaming = true;
@@ -168,30 +244,40 @@ Status CameraService::Run(const ServiceOptions& options) {
             } else {
                 QCAM_LOGE("could not start the camera: %s", StatusName(st));
             }
-        } else if (!camera_.IsStreaming()) {
-            // The transport dropped the stream, which on this hardware almost
-            // always means the cable came out.
-            QCAM_LOGW("stream stopped unexpectedly; releasing the device");
-            camera_.Close();
-            ring_.Close();
-            streaming = false;
-            published_ = 0;
         }
 
-        if (stop_event_) {
-            if (::WaitForSingleObject(stop_event_, kRetryDelayMs) == WAIT_OBJECT_0)
-                break;
+        // Idle: sleep until stopped or asked for frames. Otherwise wake every
+        // so often, to notice an unplugged camera or the idle timeout while
+        // streaming, or to retry a failed start. Demand is only polled in those
+        // cases: a reader signals it on every frame, and blocking on it would
+        // turn a failed start into a retry at the frame rate.
+        bool demanded = false;
+        if (demand && !streaming && !wanted) {
+            HANDLE handles[2] = {stop_event_, demand};
+            demanded = ::WaitForMultipleObjects(2, handles, FALSE, INFINITE) ==
+                       WAIT_OBJECT_0 + 1;
+        } else if (stop_event_) {
+            ::WaitForSingleObject(stop_event_, streaming ? kStreamingPollMs
+                                                         : kRetryDelayMs);
         } else {
             ::Sleep(kRetryDelayMs);
+        }
+        if (demand && !demanded)
+            demanded = ::WaitForSingleObject(demand, 0) == WAIT_OBJECT_0;
+        if (demanded) {
+            demanded_ever = true;
+            last_demand   = ::GetTickCount64();
         }
     }
 
     QCAM_LOGI("shutting down");
-    camera_.Close();
-    ring_.Close();
+    ReleaseCamera();
+    demand_.Close();
+    controls_.Close();
     vcam_.Stop();
     vcam_.Close();
     ::MFShutdown();
+    if (com) ::CoUninitialize();
     return Status::Ok;
 }
 
@@ -256,24 +342,52 @@ Status InstallService(const std::wstring& exe_path) {
     // Quote the path so a space in Program Files does not split the command.
     const std::wstring command = L"\"" + exe_path + L"\"";
 
+    // LOCAL SERVICE rather than LocalSystem. All the service needs is to open
+    // the WinUSB device and create the Global\ frame ring, and neither takes
+    // more than an ordinary service account. The virtual camera registration,
+    // which does need administrator rights, is done once by install.ps1.
+    constexpr wchar_t kAccount[] = L"NT AUTHORITY\\LocalService";
+
     SC_HANDLE service = ::CreateServiceW(
         manager, kServiceName, kServiceDisplay, SERVICE_ALL_ACCESS,
         SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL,
-        command.c_str(), nullptr, nullptr, nullptr,
-        // LocalSystem: it needs to create objects in the Global namespace and
-        // to open a device interface.
-        nullptr, nullptr);
+        command.c_str(), nullptr, nullptr, nullptr, kAccount, L"");
 
     if (!service) {
         const DWORD err = ::GetLastError();
-        ::CloseServiceHandle(manager);
-        if (err == ERROR_SERVICE_EXISTS) {
-            QCAM_LOGI("service already installed");
-            return Status::Ok;
+        if (err != ERROR_SERVICE_EXISTS) {
+            ::CloseServiceHandle(manager);
+            QCAM_LOGE("CreateService failed: %lu", err);
+            return Status::Io;
         }
-        QCAM_LOGE("CreateService failed: %lu", err);
-        return Status::Io;
+        // Already installed, perhaps by an older build that ran as
+        // LocalSystem from the build directory. Bring it up to date rather
+        // than leaving the old account and path in place.
+        service = ::OpenServiceW(manager, kServiceName, SERVICE_ALL_ACCESS);
+        if (!service ||
+            !::ChangeServiceConfigW(service, SERVICE_WIN32_OWN_PROCESS,
+                                    SERVICE_AUTO_START, SERVICE_ERROR_NORMAL,
+                                    command.c_str(), nullptr, nullptr, nullptr,
+                                    kAccount, L"", kServiceDisplay)) {
+            QCAM_LOGE("updating the existing service failed: %lu", ::GetLastError());
+            if (service) ::CloseServiceHandle(service);
+            ::CloseServiceHandle(manager);
+            return Status::Io;
+        }
+        QCAM_LOGI("service already installed; configuration updated");
     }
+
+    // Give the process its own SID (NT SERVICE\qcamsvc). The Frame Server also
+    // runs as LOCAL SERVICE, so the account alone cannot tell the frame ring's
+    // writer apart from its readers; the service SID can.
+    SERVICE_SID_INFO sid_info = {SERVICE_SID_TYPE_UNRESTRICTED};
+    ::ChangeServiceConfig2W(service, SERVICE_CONFIG_SERVICE_SID_INFO, &sid_info);
+
+    // Strip every privilege the service does not use from its token.
+    wchar_t privileges[] = L"SeCreateGlobalPrivilege\0SeChangeNotifyPrivilege\0";
+    SERVICE_REQUIRED_PRIVILEGES_INFOW required = {privileges};
+    ::ChangeServiceConfig2W(service, SERVICE_CONFIG_REQUIRED_PRIVILEGES_INFO,
+                            &required);
 
     SERVICE_DESCRIPTIONW description = {
         const_cast<LPWSTR>(L"Publishes frames from a Logitech QuickCam Express "
